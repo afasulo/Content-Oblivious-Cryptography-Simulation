@@ -641,6 +641,76 @@ def get_keeper_profit(model):
                total_profit += agent.profit
      return total_profit
 
+
+# --- New Metric Helper Functions ---
+
+def get_average_auction_duration(model):
+    """Calculates the average duration of completed auctions."""
+    completed_auctions = [
+        a for a in model.completed_or_failed_auctions if a['status'] == 'Completed'
+    ]
+    if not completed_auctions:
+        return 0
+    total_duration = sum(a['duration'] for a in completed_auctions)
+    return total_duration / len(completed_auctions)
+
+def get_average_price_efficiency(model):
+    """
+    Estimates average price efficiency for completed auctions.
+    NOTE: This is a simplified estimation. A precise calculation would require
+    tracking oracle price at each 'take' settlement, which isn't stored directly
+    in completed_or_failed_auctions. We use the end-time oracle price as a proxy.
+    """
+    completed_auctions = [
+        a for a in model.completed_or_failed_auctions if a['status'] == 'Completed'
+    ]
+    if not completed_auctions:
+        return 0
+
+    total_efficiency_score = 0
+    valid_auctions = 0
+
+    for auction in completed_auctions:
+        if auction['dai_raised'] > 1e-6 and 'end_time' in auction:
+             # We need the total collateral sold. This isn't explicitly stored.
+             # We can *estimate* it based on average price if needed, but it's inaccurate.
+             # A better approach would be to store total collateral sold in record_auction_end.
+             # For now, we cannot accurately calculate this metric without modifying data collection.
+             pass # Placeholder - Calculation requires modification to record_auction_end
+
+    # Since we can't calculate accurately now, return placeholder
+    # Placeholder Explanation: To calculate WeightedAvgAuctionPrice = TotalDAIRaised / TotalCollateralSold,
+    # we need TotalCollateralSold. Modify record_auction_end to store this.
+    # Then, get OraclePriceAtSettlement (approximate using end_time oracle price from model_vars).
+    # Efficiency = WeightedAvgAuctionPrice / OraclePriceAtSettlement
+    return 'N/A (Needs Data Mod)'
+
+
+def get_average_tx_latency(model_vars_df):
+    """
+    Estimates average end-to-end latency for transactions *if* execution times
+    were logged appropriately. This requires modifying the simulation to log
+    submission and execution times per transaction, which is not done by default.
+    """
+    # Placeholder Explanation: To calculate this, the DataCollector would need
+    # to be configured to collect detailed transaction timing data (submit time,
+    # execute time including OFP delays) potentially at the agent level or via
+    # custom model reporting based on the processed transactions list.
+    return 'N/A (Needs Data Mod)'
+
+def get_ofp_overhead_proxy(model):
+    """ Provides a proxy for OFP overhead based on the mode."""
+    if model.ofp_mode == 'TE':
+        # Proxy: TE Latency constant
+        return f"{TE_DECRYPTION_LATENCY:.2f}s (Decryption Latency)"
+    elif model.ofp_mode == 'VDF':
+        # Proxy: VDF Delay T + Verification Cost (if used)
+        return f"{VDF_DELAY_T:.1f}s (Delay T) + {VDF_VERIFICATION_GAS_COST:,} gas/tx (Verify Cost)"
+    else: # Baseline
+        return "0"
+
+# --- End New Metric Helper Functions ---
+
 # --- Main Model Class (Mesa 3.x compatible) ---
 class MakerLiquidationModel(mesa.Model):
     """The main agent-based model for MakerDAO Liquidations."""
@@ -697,7 +767,32 @@ class MakerLiquidationModel(mesa.Model):
                  print(f"Debug: Vault {vault_id} not found for initial CR print.")
         print("---------------------------------")
 
-        self.datacollector = mesa.DataCollector( model_reporters={ "Steps": "steps", "Time": "current_time", "OFP_Mode": "ofp_mode", "OraclePrice": lambda m: m.oracle.current_price, "ActiveAuctions": lambda m: sum(len(c.active_auctions) for c in m.maker_state.clippers.values()), "CompletedAuctions": lambda m: len([r for r in m.completed_or_failed_auctions if r['status']=='Completed']), "FailedAuctions": lambda m: len([r for r in m.completed_or_failed_auctions if r['status']=='Failed']), "TotalValueLiquidated": "total_value_liquidated", "BadDebt": get_total_bad_debt, "MEVProfit": get_mev_profit, "KeeperProfit": get_keeper_profit, }, agent_reporters={ "AgentType": lambda a: a.__class__.__name__, "DAI_Balance": lambda a: a.model.maker_state.get_agent_balance(a.unique_id), "Profit": lambda a: getattr(a, 'profit', 0), "GasSpent": lambda a: getattr(a, 'gas_spent', 0), } )
+        self.datacollector = mesa.DataCollector(
+            model_reporters={
+                "Steps": "steps",
+                "Time": "current_time",
+                "OFP_Mode": "ofp_mode",
+                "OraclePrice": lambda m: m.oracle.current_price,
+                "ActiveAuctions": lambda m: sum(len(c.active_auctions) for c in m.maker_state.clippers.values()),
+                "CompletedAuctions": lambda m: len([r for r in m.completed_or_failed_auctions if r['status']=='Completed']),
+                "FailedAuctions": lambda m: len([r for r in m.completed_or_failed_auctions if r['status']=='Failed']),
+                "TotalValueLiquidated": "total_value_liquidated",
+                "BadDebt": get_total_bad_debt,
+                "MEVProfit": get_mev_profit,
+                "KeeperProfit": get_keeper_profit,
+                # --- Added Metrics ---
+                "AvgAuctionDuration": get_average_auction_duration,
+                "AvgPriceEfficiency": get_average_price_efficiency, # Will show N/A for now
+                "OFPOverheadProxy": get_ofp_overhead_proxy,
+                # AvgTxLatency needs model_vars df, calculated post-run
+            },
+            agent_reporters={
+                "AgentType": lambda a: a.__class__.__name__,
+                "DAI_Balance": lambda a: a.model.maker_state.get_agent_balance(a.unique_id),
+                "Profit": lambda a: getattr(a, 'profit', 0),
+                "GasSpent": lambda a: getattr(a, 'gas_spent', 0),
+            }
+        )
 
         print(f"Model Initialized. OFP Mode: {self.ofp_mode}")
         print(f"Agents Created: {len(self.agents)}")
@@ -748,12 +843,27 @@ if __name__ == "__main__":
     results = {}
     scenarios = ['Baseline', 'TE', 'VDF']
 
+    # --- Run Initial Scenarios ---
     for scenario in scenarios:
         print(f"\n===== Starting {scenario} Simulation =====")
+        # --- IMPORTANT: Use the ORIGINAL VDF_DELAY_T for these runs ---
+        current_vdf_delay = VDF_DELAY_T # Store the default
+        if scenario != 'VDF':
+             # Temporarily set VDF_DELAY_T to something neutral if needed,
+             # although it shouldn't affect non-VDF modes.
+             # Or ensure VDF specific logic is only active in VDF mode.
+             # For simplicity, we assume non-VDF modes ignore VDF_DELAY_T
+             pass
+        else:
+             # Ensure the global is set to the default for the initial VDF run
+             globals()['VDF_DELAY_T'] = current_vdf_delay
+
         model_seed = random.randint(1, 10000)
         print(f"Using seed: {model_seed}")
-        PRICE_VOLATILITY = 0.50 # Set volatility for the run
+        # Ensure PRICE_VOLATILITY and PRICE_DRIFT are defined globally or passed
         print(f"Using Volatility: {PRICE_VOLATILITY}, Drift: {PRICE_DRIFT}")
+
+        # Initialize and run the model for the current scenario
         model = MakerLiquidationModel(N_BORROWERS, N_KEEPERS, N_MEV_SEARCHERS, ofp_mode=scenario, seed=model_seed)
         model.running = True
         step_count = 0
@@ -761,23 +871,21 @@ if __name__ == "__main__":
              try:
                  model.step()
              except Exception as e:
-                 print(f"\n!!!!! ERROR during model step {model.steps} (Time: {model.current_time}) !!!!!")
+                 print(f"\n!!!!! ERROR during {scenario} model step {model.steps} (Time: {model.current_time}) !!!!!")
                  print(f"Error Type: {type(e)}")
                  print(f"Error Details: {e}")
                  print(f"Oracle Price: {model.oracle.current_price}")
                  print(f"Mempool Size: {len(model.mempool.pending_txs)}")
                  import traceback
                  traceback.print_exc()
-                 model.running = False
+                 model.running = False # Stop this run
 
              step_count += 1
              if not model.running: break
              if step_count % 100 == 0:
-                  print(f"  ... Step {model.steps} completed | Time {model.current_time:.0f}s | Price {model.oracle.current_price:.2f} ...")
+                  print(f"  ... Step {model.steps} ({scenario}) completed | Time {model.current_time:.0f}s | Price {model.oracle.current_price:.2f} ...")
 
-        if not model.datacollector.model_reporters:
-             print("Warning: Data collector might not have data due to early termination.")
-
+        # Store results
         results[scenario] = {
             'model_vars': model.datacollector.get_model_vars_dataframe(),
             'agent_vars': model.datacollector.get_agent_vars_dataframe()
@@ -785,31 +893,159 @@ if __name__ == "__main__":
         print(f"===== {scenario} Simulation Finished =====")
 
     end_run_time = time.time()
-    print(f"\nTotal Simulation Run Time: {end_run_time - start_run_time:.2f} seconds")
+    print(f"\nTotal Initial Simulation Run Time: {end_run_time - start_run_time:.2f} seconds")
 
-    # Analyze and Compare Results
+
+    # --- Enhanced Analysis and Comparison ---
     print("\n--- Results Summary (Final Step) ---")
-    print(f"{'Metric':<25} | {'Baseline':<15} | {'TE':<15} | {'VDF':<15}")
-    print("-" * 75)
-    metrics_to_compare = ["MEVProfit", "KeeperProfit", "BadDebt", "TotalValueLiquidated", "CompletedAuctions", "FailedAuctions"]
+
+    # Define metrics calculated directly by DataCollector per step
+    metrics_direct = [
+        "MEVProfit", "KeeperProfit", "BadDebt", "TotalValueLiquidated",
+        "CompletedAuctions", "FailedAuctions", "AvgAuctionDuration",
+        "AvgPriceEfficiency", "OFPOverheadProxy"
+    ]
+    # Define metrics calculated post-run (add more here if implemented)
+    metrics_post_run = [
+        # "AvgTxLatency" # Example if implemented later
+    ]
+
     final_results = {}
+    all_metrics = metrics_direct + metrics_post_run
+
+    # --- Helper Function for Formatting (Improved Alignment) ---
+    def format_val(val, width=15): # Added width parameter
+        if isinstance(val, (int, float)):
+            if isinstance(val, int):
+                s = f"{val:,}"
+            elif abs(val) > 1e7 or (abs(val) < 1e-3 and val != 0):
+                 s = f"{val:.2e}"
+            else:
+                 s = f"{val:,.2f}"
+        else:
+            s = str(val)
+        # Pad the string to the desired width
+        return f"{s:<{width}}" # Use left-alignment (<) and specified width
+    # --- End Helper Function ---
+
+    # Collect final values for each scenario (Corrected Indentation Check)
     for scenario in scenarios:
         final_results[scenario] = {}
+        # Ensure 'results' dictionary was populated correctly
+        if scenario not in results or 'model_vars' not in results[scenario]:
+            print(f"Warning: Results missing for scenario '{scenario}'. Skipping.")
+            for metric in all_metrics:
+                 final_results[scenario][metric] = 'Run Missing'
+            continue # Skip to the next scenario
+
         model_df = results[scenario]['model_vars']
+        # agent_df = results[scenario]['agent_vars'] # Use if needed
+
         if not model_df.empty:
-            for metric in metrics_to_compare:
+            # Get final values for direct metrics
+            for metric in metrics_direct:
                 if metric in model_df.columns:
-                    try: final_results[scenario][metric] = model_df[metric].iloc[-1]
-                    except IndexError: final_results[scenario][metric] = 'N/A (Run End Early)'
-                else: final_results[scenario][metric] = 'N/A (Col Missing)'
-        else:
-             for metric in metrics_to_compare: final_results[scenario][metric] = 'Empty DF'
-    for metric in metrics_to_compare:
-         baseline_val = final_results['Baseline'].get(metric, 'N/A')
-         te_val = final_results['TE'].get(metric, 'N/A')
-         vdf_val = final_results['VDF'].get(metric, 'N/A')
-         def format_val(val):
-              if isinstance(val, (int, float)): return f"{val:,.2f}"
-              return str(val)
-         print(f"{metric:<25} | {format_val(baseline_val):<15} | {format_val(te_val):<15} | {format_val(vdf_val):<15}")
+                    try:
+                        final_results[scenario][metric] = model_df[metric].iloc[-1]
+                    except IndexError:
+                        final_results[scenario][metric] = 'N/A (Early End)' # Corrected message
+                else:
+                    final_results[scenario][metric] = f'N/A (Missing)' # Corrected message
+            # Calculate post-run metrics here (if any)
+            # Example:
+            # if "AvgTxLatency" in metrics_post_run:
+            #     final_results[scenario]["AvgTxLatency"] = get_average_tx_latency(model_df) # Assuming function exists
+        else: # Handle empty dataframe case
+             for metric in all_metrics: # Indent this loop under 'else'
+                 final_results[scenario][metric] = 'Empty DF' # Indent this line under the 'for'
+
+    # Print the summary table (Corrected Formatting)
+    header_width = 15 # Define column width
+    header = f"{'Metric':<25} | " + " | ".join([format_val(s, header_width) for s in scenarios])
+    print(header)
+    print("-" * len(header))
+
+    for metric in all_metrics:
+         # Pass the width to format_val for data cells too
+         values_str = " | ".join([format_val(final_results[s].get(metric, 'N/A'), header_width) for s in scenarios])
+         print(f"{metric:<25} | {values_str}")
+
     print("\nAnalysis Complete.")
+
+
+    # --- Sensitivity Analysis Setup (Example for VDF_DELAY_T) ---
+    print("\n--- Starting VDF Delay Sensitivity Analysis ---")
+
+    vdf_delays_to_test = [1.0, 5.0, 10.0, 30.0] # Example values
+    sensitivity_results = {}
+    vdf_metrics_to_track = ["KeeperProfit", "CompletedAuctions", "AvgAuctionDuration", "TotalValueLiquidated", "BadDebt", "MEVProfit"] # Added BadDebt, MEVProfit
+
+    # Store original VDF_DELAY_T to restore later if needed
+    original_vdf_delay = VDF_DELAY_T # Assuming VDF_DELAY_T is a global constant
+
+    for delay in vdf_delays_to_test:
+        print(f"\n===== Running VDF Simulation with Delay T = {delay}s =====")
+        # --- Modify the global VDF_DELAY_T for this specific run ---
+        globals()['VDF_DELAY_T'] = delay
+        # --------------------------------------------------------------
+
+        model_seed = random.randint(10001, 20000) # Use different seeds for sensitivity runs
+        print(f"Using seed: {model_seed}")
+        print(f"Using Volatility: {PRICE_VOLATILITY}, Drift: {PRICE_DRIFT}")
+
+        # Re-initialize and run the VDF model only
+        model = MakerLiquidationModel(N_BORROWERS, N_KEEPERS, N_MEV_SEARCHERS, ofp_mode='VDF', seed=model_seed)
+        model.running = True
+        step_count = 0
+        while model.running:
+             try:
+                 model.step()
+             except Exception as e:
+                 print(f"\n!!!!! ERROR during VDF sensitivity step {model.steps} (Delay {delay}) !!!!!")
+                 print(f"Error Type: {type(e)}")
+                 print(f"Error Details: {e}")
+                 import traceback
+                 traceback.print_exc()
+                 model.running = False # Stop this run
+
+             step_count += 1
+             if not model.running: break
+             # Optional: Reduce print frequency for sensitivity runs
+             # if step_count % 500 == 0:
+             #      print(f"  ... Step {model.steps} (Delay {delay}) | Time {model.current_time:.0f}s ...")
+
+        # Collect results for this delay value
+        sensitivity_results[delay] = {}
+        model_df = model.datacollector.get_model_vars_dataframe()
+        if not model_df.empty:
+            for metric in vdf_metrics_to_track:
+                 if metric in model_df.columns:
+                     try:
+                         sensitivity_results[delay][metric] = model_df[metric].iloc[-1]
+                     except IndexError:
+                          sensitivity_results[delay][metric] = 'N/A (Early End)'
+                 else:
+                      sensitivity_results[delay][metric] = 'N/A (Missing)'
+        else: # Handle empty DF for sensitivity run
+             for metric in vdf_metrics_to_track: # Indent this loop
+                  sensitivity_results[delay][metric] = 'Empty DF' # Indent this line
+
+        print(f"===== VDF Simulation Finished (Delay T = {delay}s) =====")
+
+    # Restore original VDF_DELAY_T if it was modified and needed elsewhere
+    globals()['VDF_DELAY_T'] = original_vdf_delay
+
+    # Print Sensitivity Summary Table (Corrected Formatting)
+    print("\n--- VDF Delay Sensitivity Summary ---")
+    sens_col_width = 18 # Define column width for this table
+    sens_header = f"{'VDF Delay T (s)':<{sens_col_width}} | " + " | ".join([format_val(m, sens_col_width) for m in vdf_metrics_to_track])
+    print(sens_header)
+    print("-" * len(sens_header))
+
+    for delay in vdf_delays_to_test:
+        # Format the delay value itself and the metric values
+        delay_str = format_val(f"{delay:.1f}", sens_col_width)
+        values_str = " | ".join([format_val(sensitivity_results[delay].get(metric, 'N/A'), sens_col_width) for metric in vdf_metrics_to_track])
+        print(f"{delay_str} | {values_str}")
+
+    print("\nSensitivity Analysis Complete.")
