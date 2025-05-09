@@ -656,34 +656,41 @@ def get_average_auction_duration(model):
 
 def get_average_price_efficiency(model):
     """
-    Estimates average price efficiency for completed auctions.
-    NOTE: This is a simplified estimation. A precise calculation would require
-    tracking oracle price at each 'take' settlement, which isn't stored directly
-    in completed_or_failed_auctions. We use the end-time oracle price as a proxy.
+    Calculates weighted average price efficiency for completed auctions.
+    Price efficiency = (DAI raised / collateral sold) / oracle price at end
+    A value of 1.0 means auctions sold at oracle price, > 1 is better, < 1 is worse
     """
     completed_auctions = [
-        a for a in model.completed_or_failed_auctions if a['status'] == 'Completed'
+        a for a in model.completed_or_failed_auctions 
+        if a['status'] == 'Completed' and a.get('total_collateral_sold', 0) > 1e-6
     ]
+    
     if not completed_auctions:
         return 0
 
     total_efficiency_score = 0
-    valid_auctions = 0
-
+    total_collateral_weight = 0
+    
     for auction in completed_auctions:
-        if auction['dai_raised'] > 1e-6 and 'end_time' in auction:
-             # We need the total collateral sold. This isn't explicitly stored.
-             # We can *estimate* it based on average price if needed, but it's inaccurate.
-             # A better approach would be to store total collateral sold in record_auction_end.
-             # For now, we cannot accurately calculate this metric without modifying data collection.
-             pass # Placeholder - Calculation requires modification to record_auction_end
-
-    # Since we can't calculate accurately now, return placeholder
-    # Placeholder Explanation: To calculate WeightedAvgAuctionPrice = TotalDAIRaised / TotalCollateralSold,
-    # we need TotalCollateralSold. Modify record_auction_end to store this.
-    # Then, get OraclePriceAtSettlement (approximate using end_time oracle price from model_vars).
-    # Efficiency = WeightedAvgAuctionPrice / OraclePriceAtSettlement
-    return 'N/A (Needs Data Mod)'
+        collateral_sold = auction.get('total_collateral_sold', 0)
+        dai_raised = auction.get('dai_raised', 0)
+        oracle_price = auction.get('oracle_price_at_end', 0)
+        
+        if collateral_sold > 1e-6 and oracle_price > 1e-6:
+            # Calculate weighted average auction price
+            avg_auction_price = dai_raised / collateral_sold
+            
+            # Calculate efficiency ratio (auction price vs oracle price)
+            efficiency = avg_auction_price / oracle_price
+            
+            # Add to weighted sum
+            total_efficiency_score += efficiency * collateral_sold
+            total_collateral_weight += collateral_sold
+    
+    if total_collateral_weight > 1e-6:
+        return total_efficiency_score / total_collateral_weight
+    else:
+        return 0
 
 
 def get_average_tx_latency(model_vars_df):
@@ -798,16 +805,23 @@ class MakerLiquidationModel(mesa.Model):
         print(f"Agents Created: {len(self.agents)}")
 
     def record_auction_end(self, auction):
-         if auction.status not in ["Completed", "Failed"]: return
-         self.completed_or_failed_auctions.append({
-              'id': auction.id, 'ilk': auction.ilk, 'status': auction.status,
-              'tab': auction.tab, 'dai_raised': auction.dai_raised,
-              'start_time': auction.start_time, 'end_time': self.current_time,
-              'duration': self.current_time - auction.start_time,
-         })
-         clipper = self.maker_state.clippers.get(auction.ilk)
-         if clipper and auction.id in clipper.active_auctions:
-             if auction.id in clipper.active_auctions: del clipper.active_auctions[auction.id]
+     if auction.status not in ["Completed", "Failed"]: return
+     
+     # Calculate total collateral sold
+     total_collateral_sold = auction.initial_lot - auction.remaining_lot
+     
+     self.completed_or_failed_auctions.append({
+          'id': auction.id, 'ilk': auction.ilk, 'status': auction.status,
+          'tab': auction.tab, 'dai_raised': auction.dai_raised,
+          'start_time': auction.start_time, 'end_time': self.current_time,
+          'duration': self.current_time - auction.start_time,
+          'total_collateral_sold': total_collateral_sold,  # Store this new field
+          'oracle_price_at_end': self.oracle.current_price,  # Also store oracle price at end
+     })
+     
+     clipper = self.maker_state.clippers.get(auction.ilk)
+     if clipper and auction.id in clipper.active_auctions:
+         if auction.id in clipper.active_auctions: del clipper.active_auctions[auction.id]
 
     # --- Model Step Logic using Stages ---
     def env_update(self):
@@ -837,215 +851,237 @@ class MakerLiquidationModel(mesa.Model):
         self.datacollector.collect(self)
         if self.steps >= SIMULATION_STEPS: self.running = False
 
-# --- Main Execution Block ---
+# --- Main Execution Block (Corrected for NameError and Multiple Runs) ---
 if __name__ == "__main__":
+    # --- Make sure pandas is imported ---
+    try:
+        import pandas as pd
+    except ImportError:
+        print("Error: pandas library is required. Please install it (`pip install pandas`)")
+        exit()
+    # --- End pandas import check ---
+
     start_run_time = time.time()
-    results = {}
+
+    # --- Simulation Parameters ---
+    NUM_RUNS = 5 # Number of runs per scenario (Increase for real research)
     scenarios = ['Baseline', 'TE', 'VDF']
+    # Using only the default VDF_DELAY_T for this example
+    vdf_delays_to_test = [1.0, 5.0, 30.0, 300.0] # Test 1s, 5s, 30s, 5min(300s)
 
-    # --- Run Initial Scenarios ---
-    for scenario in scenarios:
-        print(f"\n===== Starting {scenario} Simulation =====")
-        # --- IMPORTANT: Use the ORIGINAL VDF_DELAY_T for these runs ---
-        current_vdf_delay = VDF_DELAY_T # Store the default
-        if scenario != 'VDF':
-             # Temporarily set VDF_DELAY_T to something neutral if needed,
-             # although it shouldn't affect non-VDF modes.
-             # Or ensure VDF specific logic is only active in VDF mode.
-             # For simplicity, we assume non-VDF modes ignore VDF_DELAY_T
-             pass
-        else:
-             # Ensure the global is set to the default for the initial VDF run
-             globals()['VDF_DELAY_T'] = current_vdf_delay
+    # --- Data Storage ---
+    all_model_results = []
+    all_keeper_final_profits = []
 
-        model_seed = random.randint(1, 10000)
-        print(f"Using seed: {model_seed}")
-        # Ensure PRICE_VOLATILITY and PRICE_DRIFT are defined globally or passed
-        print(f"Using Volatility: {PRICE_VOLATILITY}, Drift: {PRICE_DRIFT}")
+    # --- Main Loop for Multiple Runs ---
+    total_simulations = NUM_RUNS * (len(scenarios) -1 + len(vdf_delays_to_test))
+    current_simulation = 0
 
-        # Initialize and run the model for the current scenario
-        model = MakerLiquidationModel(N_BORROWERS, N_KEEPERS, N_MEV_SEARCHERS, ofp_mode=scenario, seed=model_seed)
-        model.running = True
-        step_count = 0
-        while model.running:
-             try:
-                 model.step()
-             except Exception as e:
-                 print(f"\n!!!!! ERROR during {scenario} model step {model.steps} (Time: {model.current_time}) !!!!!")
-                 print(f"Error Type: {type(e)}")
-                 print(f"Error Details: {e}")
-                 print(f"Oracle Price: {model.oracle.current_price}")
-                 print(f"Mempool Size: {len(model.mempool.pending_txs)}")
-                 import traceback
-                 traceback.print_exc()
-                 model.running = False # Stop this run
+    for run in range(NUM_RUNS):
+        print(f"\n===== Starting Run {run + 1} / {NUM_RUNS} =====")
+        run_seed_base = random.randint(10000 * run, 10000 * (run + 1) -1)
 
-             step_count += 1
-             if not model.running: break
-             if step_count % 100 == 0:
-                  print(f"  ... Step {model.steps} ({scenario}) completed | Time {model.current_time:.0f}s | Price {model.oracle.current_price:.2f} ...")
+        for scenario in scenarios:
+            # Handle VDF delay variation if testing multiple delays
+            if scenario == 'VDF':
+                for delay in vdf_delays_to_test:
+                    current_simulation += 1
+                    print(f"\n--- Running Scenario: {scenario} (T={delay}s) --- (Sim {current_simulation}/{total_simulations})")
+                    globals()['VDF_DELAY_T'] = delay
+                    model_seed = run_seed_base + scenarios.index(scenario) * 100 + vdf_delays_to_test.index(delay)
+                    scenario_label = f"{scenario}_T{delay}"
 
-        # Store results
-        results[scenario] = {
-            'model_vars': model.datacollector.get_model_vars_dataframe(),
-            'agent_vars': model.datacollector.get_agent_vars_dataframe()
-        }
-        print(f"===== {scenario} Simulation Finished =====")
+                    # Initialize and run model
+                    model = MakerLiquidationModel(N_BORROWERS, N_KEEPERS, N_MEV_SEARCHERS, ofp_mode=scenario, seed=model_seed)
+                    model.running = True
+                    step_count = 0
+                    while model.running:
+                        try:
+                            model.step()
+                        except Exception as e:
+                            print(f"\n!!!!! ERROR during {scenario_label} Run {run+1} Step {model.steps} !!!!!")
+                            print(f"Error: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            model.running = False
+                        step_count += 1
+                        if not model.running : break
+                        # Optional: Reduce print frequency
+                        # if step_count % 500 == 0:
+                        #      print(f"  ... Step {model.steps} ({scenario_label} Run {run+1}) ...")
+
+                    # Collect Results
+                    model_df = model.datacollector.get_model_vars_dataframe()
+                    agent_df = model.datacollector.get_agent_vars_dataframe()
+
+                    if not model_df.empty:
+                         final_vars = model_df.iloc[-1].to_dict()
+                         final_vars['run'] = run + 1
+                         final_vars['scenario'] = scenario_label
+                         all_model_results.append(final_vars)
+                    else: print(f"Warning: Empty model_df for {scenario_label} Run {run+1}")
+
+                    if not agent_df.empty:
+                        final_step = agent_df.index.get_level_values('Step').max()
+                        try: # Added try-except for potential empty index
+                            final_agent_data = agent_df.xs(final_step, level='Step')
+                            keeper_profits = final_agent_data[final_agent_data['AgentType'] == 'KeeperAgent']['Profit'].tolist()
+                            all_keeper_final_profits.append({
+                                'run': run + 1, 'scenario': scenario_label, 'keeper_profits': keeper_profits
+                             })
+                        except KeyError:
+                             print(f"Warning: Could not access final step {final_step} in agent_df for {scenario_label} Run {run+1}")
+                    else: print(f"Warning: Empty agent_df for {scenario_label} Run {run+1}")
+
+            else: # Handle Baseline and TE scenarios
+                current_simulation += 1
+                print(f"\n--- Running Scenario: {scenario} --- (Sim {current_simulation}/{total_simulations})")
+                model_seed = run_seed_base + scenarios.index(scenario)
+                scenario_label = scenario
+
+                # Initialize and run model
+                model = MakerLiquidationModel(N_BORROWERS, N_KEEPERS, N_MEV_SEARCHERS, ofp_mode=scenario, seed=model_seed)
+                model.running = True
+                step_count = 0
+                while model.running:
+                    try:
+                        model.step()
+                    except Exception as e:
+                        print(f"\n!!!!! ERROR during {scenario_label} Run {run+1} Step {model.steps} !!!!!")
+                        print(f"Error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        model.running = False
+                    step_count += 1
+                    if not model.running : break
+                    # Optional: Reduce print frequency
+                    # if step_count % 500 == 0:
+                    #      print(f"  ... Step {model.steps} ({scenario_label} Run {run+1}) ...")
+
+                # Collect Results
+                model_df = model.datacollector.get_model_vars_dataframe()
+                agent_df = model.datacollector.get_agent_vars_dataframe()
+
+                if not model_df.empty:
+                     final_vars = model_df.iloc[-1].to_dict()
+                     final_vars['run'] = run + 1
+                     final_vars['scenario'] = scenario_label
+                     all_model_results.append(final_vars)
+                else: print(f"Warning: Empty model_df for {scenario_label} Run {run+1}")
+
+                if not agent_df.empty:
+                    final_step = agent_df.index.get_level_values('Step').max()
+                    try: # Added try-except
+                        final_agent_data = agent_df.xs(final_step, level='Step')
+                        keeper_profits = final_agent_data[final_agent_data['AgentType'] == 'KeeperAgent']['Profit'].tolist()
+                        all_keeper_final_profits.append({
+                            'run': run + 1, 'scenario': scenario_label, 'keeper_profits': keeper_profits
+                         })
+                    except KeyError:
+                         print(f"Warning: Could not access final step {final_step} in agent_df for {scenario_label} Run {run+1}")
+                else: print(f"Warning: Empty agent_df for {scenario_label} Run {run+1}")
+
+    # --- Restore default VDF_DELAY_T if modified ---
+    globals()['VDF_DELAY_T'] = vdf_delays_to_test[0] # Restore default
 
     end_run_time = time.time()
-    print(f"\nTotal Initial Simulation Run Time: {end_run_time - start_run_time:.2f} seconds")
+    print(f"\nTotal Simulation Run Time ({NUM_RUNS} runs): {end_run_time - start_run_time:.2f} seconds")
+
+    # --- Aggregate and Analyze Results ---
+    if not all_model_results:
+        print("\nNo simulation results collected. Exiting analysis.")
+    else:
+        results_df = pd.DataFrame(all_model_results)
+
+        # --- Define Helper Functions WITHIN scope ---
+        def format_val(val, width=15):
+            if isinstance(val, (int, float)):
+                if isinstance(val, int): s = f"{val:,}"
+                elif abs(val) > 1e7 or (abs(val) < 1e-3 and val != 0): s = f"{val:.2e}"
+                else: s = f"{val:,.2f}"
+            else: s = str(val)
+            return f"{s:<{width}}"
+
+        def format_agg(mean_val, std_val, width):
+            if pd.isna(mean_val): return format_val("N/A", width)
+            mean_str = format_val(mean_val, width=0)
+            std_str = format_val(std_val, width=0) if pd.notna(std_val) else "0.00"
+            combined = f"{mean_str} ± {std_str}"
+            return format_val(combined, width)
+        # --- End Helper Functions ---
 
 
-    # --- Enhanced Analysis and Comparison ---
-    print("\n--- Results Summary (Final Step) ---")
+        # Calculate Mean and Std Dev for key metrics
+        metrics_to_aggregate = [
+            "MEVProfit", "KeeperProfit", "BadDebt", "TotalValueLiquidated",
+            "CompletedAuctions", "FailedAuctions", "AvgAuctionDuration","AvgPriceEfficiency"
+        ]
+        aggregation = results_df.groupby('scenario')[metrics_to_aggregate].agg(['mean', 'std'])
 
-    # Define metrics calculated directly by DataCollector per step
-    metrics_direct = [
-        "MEVProfit", "KeeperProfit", "BadDebt", "TotalValueLiquidated",
-        "CompletedAuctions", "FailedAuctions", "AvgAuctionDuration",
-        "AvgPriceEfficiency", "OFPOverheadProxy"
-    ]
-    # Define metrics calculated post-run (add more here if implemented)
-    metrics_post_run = [
-        # "AvgTxLatency" # Example if implemented later
-    ]
+        # Calculate Keeper Profit Distribution Stats
+        profit_stats = {}
+        scenario_profits_all_runs = {}
+        for record in all_keeper_final_profits:
+            scenario = record['scenario']
+            if scenario not in scenario_profits_all_runs: scenario_profits_all_runs[scenario] = []
+            if record['keeper_profits']: scenario_profits_all_runs[scenario].extend(record['keeper_profits'])
 
-    final_results = {}
-    all_metrics = metrics_direct + metrics_post_run
+        processed_scenarios = results_df['scenario'].unique()
+        for scenario in processed_scenarios:
+             all_profits = scenario_profits_all_runs.get(scenario, [])
+             if all_profits:
+                 profit_series = pd.Series(all_profits)
+                 profit_stats[scenario] = {
+                     'Mean Profit': profit_series.mean(),
+                     'Median Profit': profit_series.median(),
+                     'Std Dev Profit': profit_series.std(),
+                     'Total Keepers': len(all_profits)
+                 }
+             else:
+                 profit_stats[scenario] = {'Mean Profit': 0, 'Median Profit': 0, 'Std Dev Profit': 0, 'Total Keepers': 0}
 
-    # --- Helper Function for Formatting (Improved Alignment) ---
-    def format_val(val, width=15): # Added width parameter
-        if isinstance(val, (int, float)):
-            if isinstance(val, int):
-                s = f"{val:,}"
-            elif abs(val) > 1e7 or (abs(val) < 1e-3 and val != 0):
-                 s = f"{val:.2e}"
+
+        # --- Print Aggregated Results Table ---
+        print("\n--- Aggregated Results Summary (Mean +/- Std Dev) ---")
+        header_width = 18
+        final_scenarios = aggregation.index.tolist() # Scenarios that actually have results
+
+        # Use the format_val defined *above* this printing section
+        header = f"{'Metric':<25} | " + " | ".join([format_val(s, header_width) for s in final_scenarios])
+        print(header)
+        print("-" * len(header))
+
+        # Print aggregated model metrics (using format_agg which uses format_val)
+        for metric in metrics_to_aggregate:
+            if metric in aggregation.columns.get_level_values(0):
+                 values_str = " | ".join([format_agg(aggregation.loc[s, (metric, 'mean')], aggregation.loc[s, (metric, 'std')], header_width) for s in final_scenarios])
+                 print(f"{metric:<25} | {values_str}")
             else:
-                 s = f"{val:,.2f}"
-        else:
-            s = str(val)
-        # Pad the string to the desired width
-        return f"{s:<{width}}" # Use left-alignment (<) and specified width
-    # --- End Helper Function ---
+                 print(f"{metric:<25} | " + " | ".join([format_val("N/A", header_width)] * len(final_scenarios)))
 
-    # Collect final values for each scenario (Corrected Indentation Check)
-    for scenario in scenarios:
-        final_results[scenario] = {}
-        # Ensure 'results' dictionary was populated correctly
-        if scenario not in results or 'model_vars' not in results[scenario]:
-            print(f"Warning: Results missing for scenario '{scenario}'. Skipping.")
-            for metric in all_metrics:
-                 final_results[scenario][metric] = 'Run Missing'
-            continue # Skip to the next scenario
+        # Print Keeper Profit Distribution Stats (using format_val)
+        print("-" * len(header))
+        print(f"{'Keeper Profit Dist.':<25} | " + " | ".join([format_val("", header_width)] * len(final_scenarios)))
+        for stat_name, display_name in [('Mean Profit', 'Mean Keeper Profit'), ('Median Profit', 'Median Keeper Profit'), ('Std Dev Profit', 'Std Dev Keeper Profit')]:
+             values_str = " | ".join([format_val(profit_stats.get(s, {}).get(stat_name, 'N/A'), header_width) for s in final_scenarios])
+             print(f"{display_name:<25} | {values_str}")
 
-        model_df = results[scenario]['model_vars']
-        # agent_df = results[scenario]['agent_vars'] # Use if needed
+        # Print OFP Overhead Proxy (using format_val)
+        print("-" * len(header))
+        overhead_metric = "OFPOverheadProxy"
+        overhead_values = {}
+        if overhead_metric in results_df.columns:
+             first_run_data = results_df.drop_duplicates(subset=['scenario'], keep='first').set_index('scenario')
+             for s in final_scenarios:
+                 if s in first_run_data.index: overhead_values[s] = first_run_data.loc[s, overhead_metric]
+                 else: overhead_values[s] = "N/A"
+        values_str = " | ".join([format_val(overhead_values.get(s, "N/A"), header_width) for s in final_scenarios])
+        print(f"{overhead_metric:<25} | {values_str}")
 
-        if not model_df.empty:
-            # Get final values for direct metrics
-            for metric in metrics_direct:
-                if metric in model_df.columns:
-                    try:
-                        final_results[scenario][metric] = model_df[metric].iloc[-1]
-                    except IndexError:
-                        final_results[scenario][metric] = 'N/A (Early End)' # Corrected message
-                else:
-                    final_results[scenario][metric] = f'N/A (Missing)' # Corrected message
-            # Calculate post-run metrics here (if any)
-            # Example:
-            # if "AvgTxLatency" in metrics_post_run:
-            #     final_results[scenario]["AvgTxLatency"] = get_average_tx_latency(model_df) # Assuming function exists
-        else: # Handle empty dataframe case
-             for metric in all_metrics: # Indent this loop under 'else'
-                 final_results[scenario][metric] = 'Empty DF' # Indent this line under the 'for'
+        # Print metrics that still need data modification (using format_val)
+        # print("-" * len(header))
+        # for metric in ["AvgPriceEfficiency"]:
+        #      values_str = " | ".join([format_val("N/A (Needs Data Mod)", header_width) for _ in final_scenarios])
+        #      print(f"{metric:<25} | {values_str}")
 
-    # Print the summary table (Corrected Formatting)
-    header_width = 15 # Define column width
-    header = f"{'Metric':<25} | " + " | ".join([format_val(s, header_width) for s in scenarios])
-    print(header)
-    print("-" * len(header))
-
-    for metric in all_metrics:
-         # Pass the width to format_val for data cells too
-         values_str = " | ".join([format_val(final_results[s].get(metric, 'N/A'), header_width) for s in scenarios])
-         print(f"{metric:<25} | {values_str}")
-
-    print("\nAnalysis Complete.")
-
-
-    # --- Sensitivity Analysis Setup (Example for VDF_DELAY_T) ---
-    print("\n--- Starting VDF Delay Sensitivity Analysis ---")
-
-    vdf_delays_to_test = [1.0, 5.0, 10.0, 30.0] # Example values
-    sensitivity_results = {}
-    vdf_metrics_to_track = ["KeeperProfit", "CompletedAuctions", "AvgAuctionDuration", "TotalValueLiquidated", "BadDebt", "MEVProfit"] # Added BadDebt, MEVProfit
-
-    # Store original VDF_DELAY_T to restore later if needed
-    original_vdf_delay = VDF_DELAY_T # Assuming VDF_DELAY_T is a global constant
-
-    for delay in vdf_delays_to_test:
-        print(f"\n===== Running VDF Simulation with Delay T = {delay}s =====")
-        # --- Modify the global VDF_DELAY_T for this specific run ---
-        globals()['VDF_DELAY_T'] = delay
-        # --------------------------------------------------------------
-
-        model_seed = random.randint(10001, 20000) # Use different seeds for sensitivity runs
-        print(f"Using seed: {model_seed}")
-        print(f"Using Volatility: {PRICE_VOLATILITY}, Drift: {PRICE_DRIFT}")
-
-        # Re-initialize and run the VDF model only
-        model = MakerLiquidationModel(N_BORROWERS, N_KEEPERS, N_MEV_SEARCHERS, ofp_mode='VDF', seed=model_seed)
-        model.running = True
-        step_count = 0
-        while model.running:
-             try:
-                 model.step()
-             except Exception as e:
-                 print(f"\n!!!!! ERROR during VDF sensitivity step {model.steps} (Delay {delay}) !!!!!")
-                 print(f"Error Type: {type(e)}")
-                 print(f"Error Details: {e}")
-                 import traceback
-                 traceback.print_exc()
-                 model.running = False # Stop this run
-
-             step_count += 1
-             if not model.running: break
-             # Optional: Reduce print frequency for sensitivity runs
-             # if step_count % 500 == 0:
-             #      print(f"  ... Step {model.steps} (Delay {delay}) | Time {model.current_time:.0f}s ...")
-
-        # Collect results for this delay value
-        sensitivity_results[delay] = {}
-        model_df = model.datacollector.get_model_vars_dataframe()
-        if not model_df.empty:
-            for metric in vdf_metrics_to_track:
-                 if metric in model_df.columns:
-                     try:
-                         sensitivity_results[delay][metric] = model_df[metric].iloc[-1]
-                     except IndexError:
-                          sensitivity_results[delay][metric] = 'N/A (Early End)'
-                 else:
-                      sensitivity_results[delay][metric] = 'N/A (Missing)'
-        else: # Handle empty DF for sensitivity run
-             for metric in vdf_metrics_to_track: # Indent this loop
-                  sensitivity_results[delay][metric] = 'Empty DF' # Indent this line
-
-        print(f"===== VDF Simulation Finished (Delay T = {delay}s) =====")
-
-    # Restore original VDF_DELAY_T if it was modified and needed elsewhere
-    globals()['VDF_DELAY_T'] = original_vdf_delay
-
-    # Print Sensitivity Summary Table (Corrected Formatting)
-    print("\n--- VDF Delay Sensitivity Summary ---")
-    sens_col_width = 18 # Define column width for this table
-    sens_header = f"{'VDF Delay T (s)':<{sens_col_width}} | " + " | ".join([format_val(m, sens_col_width) for m in vdf_metrics_to_track])
-    print(sens_header)
-    print("-" * len(sens_header))
-
-    for delay in vdf_delays_to_test:
-        # Format the delay value itself and the metric values
-        delay_str = format_val(f"{delay:.1f}", sens_col_width)
-        values_str = " | ".join([format_val(sensitivity_results[delay].get(metric, 'N/A'), sens_col_width) for metric in vdf_metrics_to_track])
-        print(f"{delay_str} | {values_str}")
-
-    print("\nSensitivity Analysis Complete.")
+        print("\nAggregated Analysis Complete.")
