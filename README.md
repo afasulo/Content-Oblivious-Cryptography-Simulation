@@ -52,8 +52,8 @@ These instructions will help you get a copy of the project up and running on you
 
 1.  Clone the repository:
     ```bash
-    git clone [https://github.com/YourUsername/](https://github.com/YourUsername/)[Choose Your Repo Name Here].git
-    cd [Choose Your Repo Name Here]
+    git clone 
+    cd 
     ```
 
 2.  Create and activate a virtual environment (recommended):
