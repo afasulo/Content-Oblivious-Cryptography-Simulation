@@ -2,11 +2,11 @@
 
 ## Agent-Based Simulation of MakerDAO Liquidations with Order Fairness Protocols
 
-This project presents an agent-based simulation built using the Mesa framework to analyze the economic impact of different content-oblivious transaction ordering mechanisms—Threshold Encryption (TE) and Verifiable Delay Functions (VDFs)—on the MakerDAO Liquidation 2.0 Dutch auction system. The simulation specifically investigates how these Order Fairness Protocols (OFPs) can mitigate Maximal Extractable Value (MEV), primarily front-running attacks targeting liquidation auction bids.
+This project presents an agent-based simulation built using the Mesa framework to analyze the economic impact of different content-oblivious transaction ordering mechanisms—Threshold Encryption (TE) and Verifiable Delay Functions (VDFs)—on the crypto MakerDAO Liquidation market system. The simulation specifically investigates how these Order Fairness Protocols (OFPs) can mitigate Maximal Extractable Value (MEV), primarily front-running attacks targeting liquidation auction bids.
 
 ## Project Context
 
-This simulation was developed as a project checkpoint report focusing on the economic impact analysis of content-oblivious ordering in DeFi liquidations. It builds upon literature review and a detailed research plan.
+This simulation was developed as a research project focusing on the economic impact analysis of content-oblivious ordering in DeFi liquidations markets0. It builds upon literature review and a detailed research plan.
 
 ## Model Overview
 
